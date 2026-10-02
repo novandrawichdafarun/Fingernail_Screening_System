@@ -123,17 +123,33 @@ def run_pipeline(data: bytes, max_side: int, num_iter: int):
         calculate_sharpness(enhanced),
     )
 
+FORMATS = {
+    # label : (format Pillow, mime, ekstensi, opsi simpan)
+    "JPG (q95)": ("JPEG", "image/jpeg", "jpg", {"quality": 95}),
+    "PNG (lossless)": ("PNG", "image/png", "png", {}),
+    "BMP (lossless, ukuran besar)": ("BMP", "image/bmp", "bmp", {}),
+}
 
 def encode_image(arr, fmt):
+    pill_format, mime, ext, options = FORMATS[fmt]
+    
     buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format=pill_format, **options)
+    return buf.getvalue(), mime, ext
 
-    if fmt == "PNG (lossless)":
-        Image.fromarray(arr).save(buf, format="PNG")
-        return buf.getvalue(), "image/png", "png"
+# Cache dibatasi agar gambar tidak menumpuk di memori server
+@st.cache_data(show_spinner=False, max_entries=3, ttl=600)
+def build_downloads(data: bytes, max_side: int, num_iter: int, fmt_label: str):
+    """Siapkan file unduhan original (resolusi asli) dan enhanced."""
+    _, enhanced, _, _ = run_pipeline(data, max_side, num_iter)
 
-    Image.fromarray(arr).save(buf, format="JPEG", quality=95)
-    return buf.getvalue(), "image/jpeg", "jpg"
+    # Original diunduh pada resolusi aslinya (tanpa pengecilan)
+    original_full = decode_image(data, max_side=10**9)
 
+    orig_bytes, mime, ext = encode_image(original_full, fmt_label)
+    enh_bytes, _, _ = encode_image(enhanced, fmt_label)
+
+    return orig_bytes, enh_bytes, mime, ext
 
 def quality_label(sharpness):
     if sharpness >= 500:
@@ -164,7 +180,7 @@ num_iter = st.sidebar.slider(
 
 save_format = st.sidebar.selectbox(
     "Format unduhan",
-    ["JPG (q95)", "PNG (lossless)"],
+    list(FORMATS.keys()),
 )
 
 st.sidebar.caption(
@@ -244,14 +260,30 @@ with right:
         level, text = quality_label(s_after)
         getattr(st, level)(f"**Kualitas:** {text}")
 
-        data, mime, ext = encode_image(enhanced, save_format)
-        filename = f"fingernail_{datetime.now():%Y%m%d_%H%M%S}.{ext}"
+        orig_bytes, enh_bytes, mime, ext = build_downloads(
+            image_bytes, max_side, num_iter, save_format
+        )
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "💾 Unduh Gambar Original",
+                data=orig_bytes,
+                file_name=f"fingernail_original_{stamp}.{ext}",
+                mime=mime,
+            )
+        with d2:
+            st.download_button(
+                "💾 Unduh Gambar Enhanced",
+                data=enh_bytes,
+                file_name=f"fingernail_enhanced_{stamp}.{ext}",
+                mime=mime,
+            )
 
-        st.download_button(
-            "💾 Unduh Gambar Enhanced",
-            data=data,
-            file_name=filename,
-            mime=mime,
+        st.caption(
+            "Gambar original diunduh pada resolusi aslinya. "
+            "Gambar enhanced mengikuti resolusi maksimum di sidebar."
         )
 
         st.markdown("### 🧠 Hasil Pengujian")
