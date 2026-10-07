@@ -114,6 +114,146 @@ def deblur_richardson_lucy(img, num_iter=15):
     return (deblurred * 255).astype(np.uint8)
 
 
+MAX_PSF_SIGMA = 4.5   # batas sigma PSF agar tidak terjadi ringing berlebihan
+
+
+def motion_psf(length, angle):
+    """PSF motion blur linear (panjang dalam piksel, sudut dalam derajat)."""
+    length = int(length)
+    length += 1 - length % 2          # buat ganjil
+    c = length // 2
+
+    rad = np.deg2rad(angle)
+    dx, dy = np.cos(rad) * c, -np.sin(rad) * c
+
+    psf = np.zeros((length, length), np.float32)
+    cv2.line(
+        psf,
+        (int(round(c - dx)), int(round(c - dy))),
+        (int(round(c + dx)), int(round(c + dy))),
+        1.0, 1,
+    )
+    return psf / psf.sum()
+
+
+def estimate_blur_sigma(img):
+    """
+    Estimasi tingkat blur efektif (sigma, dalam piksel) dari rasio gradien
+    tepi sebelum dan sesudah gambar di-blur ulang. Ini perkiraan heuristik:
+    gambar tajam biasanya bernilai sekitar 1.0-1.4, gambar blur lebih besar.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gray = cv2.GaussianBlur(gray, (0, 0), 1.0)   # menekan pengaruh noise
+
+    def grad_mag(a):
+        gx = cv2.Sobel(a, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(a, cv2.CV_32F, 0, 1, ksize=3)
+        return np.sqrt(gx * gx + gy * gy)
+
+    sigma_r = 1.5
+    g1 = grad_mag(gray)
+    g2 = grad_mag(cv2.GaussianBlur(gray, (0, 0), sigma_r))
+
+    mask = g1 > np.percentile(g1, 95)       # hanya tepi yang kuat
+    if mask.sum() < 50:
+        return 0.0
+
+    r = float(np.clip(np.median(g2[mask] / np.maximum(g1[mask], 1e-6)), 0.05, 0.98))
+    sigma_total = sigma_r * r / np.sqrt(1 - r**2)
+
+    # kurangi pengaruh pre-blur sigma = 1.0
+    return float(np.sqrt(max(sigma_total**2 - 1.0, 0.0)))
+
+
+def blur_level(sigma):
+    if sigma < 1.7:
+        return "Tajam"
+    if sigma < 2.7:
+        return "Agak blur"
+    return "Blur"
+
+
+def deblur_rltv(img, num_iter=25, sigma=None, psf=None, tv_lambda=0.004):
+    """
+    Richardson-Lucy dengan regularisasi Total Variation (RL-TV)
+    hanya pada channel L (kecerahan), sehingga warna kuku (channel A/B)
+    tidak berubah dan tidak muncul warna pinggiran. TV menekan noise
+    dan ringing yang biasa muncul pada Richardson-Lucy biasa.
+
+    Isi `sigma` untuk blur Gaussian (jalur cepat, filter separable),
+    atau `psf` untuk PSF bebas (mis. motion blur).
+    """
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    L = lab[:, :, 0].astype(np.float32) / 255.0
+
+    if sigma is not None:
+        # PSF Gaussian simetris: operator forward = adjoint
+        def forward(a):
+            return cv2.GaussianBlur(a, (0, 0), sigma)
+
+        adjoint = forward
+    else:
+        psf = psf.astype(np.float32)
+        psf_flip = np.ascontiguousarray(psf[::-1, ::-1])
+
+        def forward(a):
+            return cv2.filter2D(a, -1, psf_flip, borderType=cv2.BORDER_REFLECT)
+
+        def adjoint(a):
+            return cv2.filter2D(a, -1, psf, borderType=cv2.BORDER_REFLECT)
+
+    f = np.maximum(L, 1e-3)
+    u = f.copy()
+
+    for _ in range(num_iter):
+        ratio = f / np.maximum(forward(u), 1e-4)
+        corr = adjoint(ratio)
+
+        gy, gx = np.gradient(u)
+        mag = np.sqrt(gx * gx + gy * gy + 1e-6)
+        div = np.gradient(gx / mag, axis=1) + np.gradient(gy / mag, axis=0)
+
+        u = u * corr / np.maximum(1.0 - tv_lambda * div, 0.5)
+
+    lab[:, :, 0] = np.clip(u * 255.0, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+
+def run_deblur(img, opts):
+    """Memilih metode deblurring. Mengembalikan (gambar, keterangan)."""
+    method = opts["deblur_method"]
+
+    if method == "standard":
+        return (
+            deblur_richardson_lucy(img, opts["num_iter"]),
+            "Deblurring (Richardson-Lucy standar)",
+        )
+
+    if method == "manual":
+        if opts["blur_type"] == "motion":
+            psf = motion_psf(opts["motion_len"], opts["motion_angle"])
+            label = (
+                f"Deblur Manual (motion {opts['motion_len']} px, "
+                f"{opts['motion_angle']}°)"
+            )
+            return deblur_rltv(img, opts["rl_iter"], psf=psf), label
+
+        label = f"Deblur Manual (Gaussian σ={opts['psf_sigma']:.1f})"
+        return deblur_rltv(img, opts["rl_iter"], sigma=opts["psf_sigma"]), label
+
+    # --- Auto ---
+    est = estimate_blur_sigma(img)
+    sigma = min(max(est - 1.0, 0.0) * opts["strength"], MAX_PSF_SIGMA)
+
+    if sigma < 0.6:
+        return img, f"Auto Deblur dilewati (gambar sudah cukup tajam, blur≈{est:.1f})"
+
+    return (
+        deblur_rltv(img, opts["rl_iter"], sigma=sigma),
+        f"Auto Deblur (blur≈{est:.1f}, σ PSF≈{sigma:.1f})",
+    )
+
+
 def unsharp_mask(img, amount=0.6, sigma=1.5):
     blur = cv2.GaussianBlur(img, (0, 0), sigma)
     return cv2.addWeighted(img, 1 + amount, blur, -amount, 0)
@@ -174,8 +314,8 @@ def enhance_image(image, opts):
         applied.append("Noise Reduction")
 
     if opts["deblur"]:
-        out = deblur_richardson_lucy(out, opts["num_iter"])
-        applied.append("Deblurring (Richardson-Lucy)")
+        out, note = run_deblur(out, opts)
+        applied.append(note)
 
     if opts["sharpen"]:
         out = unsharp_mask(out, opts["sharpen_amount"])
@@ -228,6 +368,8 @@ def run_pipeline(data: bytes, max_side: int, opts: dict):
         calculate_sharpness(original),
         calculate_sharpness(enhanced),
         applied,
+        estimate_blur_sigma(original),
+        estimate_blur_sigma(enhanced),
     )
 
 
@@ -251,7 +393,7 @@ def encode_image(arr, fmt_label):
 @st.cache_data(show_spinner=False, max_entries=3, ttl=600)
 def build_downloads(data: bytes, max_side: int, opts: dict, fmt_label: str):
     """Siapkan file unduhan original (resolusi asli) dan enhanced."""
-    _, enhanced, _, _, _ = run_pipeline(data, max_side, opts)
+    enhanced = run_pipeline(data, max_side, opts)[1]
 
     # Original diunduh pada resolusi aslinya (tanpa pengecilan)
     original_full = decode_image(data, max_side=10**9)
@@ -321,13 +463,60 @@ opts["denoise_h"] = (
 )
 
 opts["deblur"] = st.sidebar.checkbox(
-    "5. Deblurring (Richardson-Lucy)",
+    "5. Deblurring (pemulihan gambar blur)",
     value=True,
+    help="Memperjelas gambar yang blur (kurang fokus / bergerak).",
 )
-opts["num_iter"] = (
-    st.sidebar.slider("Iterasi Richardson-Lucy", 5, 30, 15)
-    if opts["deblur"] else 15
+
+# nilai default (dipakai jika opsi tidak ditampilkan)
+opts.update(
+    deblur_method="auto", strength=1.0, rl_iter=25,
+    blur_type="gaussian", psf_sigma=2.0,
+    motion_len=15, motion_angle=0, num_iter=15,
 )
+
+if opts["deblur"]:
+    method_label = st.sidebar.selectbox(
+        "Metode deblurring",
+        [
+            "Auto (estimasi blur otomatis)",
+            "Manual (atur sendiri)",
+            "Standar (Richardson-Lucy, σ tetap)",
+        ],
+        help=(
+            "Auto: tingkat blur diperkirakan dari gambar lalu dipulihkan "
+            "(RL-TV pada channel L, warna tidak berubah). "
+            "Manual: Anda menentukan jenis dan besar blur. "
+            "Standar: metode lama dengan σ=2."
+        ),
+    )
+
+    if method_label.startswith("Auto"):
+        opts["deblur_method"] = "auto"
+        opts["strength"] = st.sidebar.slider(
+            "Kekuatan deblurring", 0.5, 2.0, 1.0, 0.1,
+            help="Naikkan jika hasil masih blur; turunkan jika muncul halo / noise.",
+        )
+        opts["rl_iter"] = st.sidebar.slider("Iterasi RL-TV", 10, 50, 25)
+
+    elif method_label.startswith("Manual"):
+        opts["deblur_method"] = "manual"
+        blur_choice = st.sidebar.radio(
+            "Jenis blur",
+            ["Gaussian (tidak fokus)", "Motion (gerakan)"],
+        )
+        if blur_choice.startswith("Motion"):
+            opts["blur_type"] = "motion"
+            opts["motion_len"] = st.sidebar.slider("Panjang gerakan (px)", 3, 41, 15, 2)
+            opts["motion_angle"] = st.sidebar.slider("Arah gerakan (derajat)", 0, 179, 0)
+        else:
+            opts["blur_type"] = "gaussian"
+            opts["psf_sigma"] = st.sidebar.slider("Sigma blur", 0.5, 5.0, 2.0, 0.1)
+        opts["rl_iter"] = st.sidebar.slider("Iterasi RL-TV", 10, 50, 25)
+
+    else:
+        opts["deblur_method"] = "standard"
+        opts["num_iter"] = st.sidebar.slider("Iterasi Richardson-Lucy", 5, 30, 15)
 
 opts["sharpen"] = st.sidebar.checkbox(
     "6. Sharpening (Unsharp Mask)",
@@ -408,9 +597,10 @@ with right:
     else:
         try:
             with st.spinner("Memproses enhancement... mohon tunggu."):
-                original, enhanced, s_before, s_after, applied = run_pipeline(
-                    image_bytes, max_side, opts
-                )
+                (
+                    original, enhanced, s_before, s_after,
+                    applied, blur_before, blur_after,
+                ) = run_pipeline(image_bytes, max_side, opts)
         except Exception as e:
             st.error(f"Gagal memproses gambar: {e}")
             st.stop()
@@ -434,8 +624,28 @@ with right:
         m2.metric("Sharpness sebelum", f"{s_before:.2f}")
         m3.metric("Sharpness sesudah", f"{s_after:.2f}")
 
+        b1, b2 = st.columns(2)
+        b1.metric(
+            "Estimasi blur sebelum (σ)",
+            f"{blur_before:.2f}",
+            help="Perkiraan heuristik: sekitar 1.0-1.4 untuk gambar tajam, makin besar makin blur.",
+        )
+        b2.metric(
+            "Estimasi blur sesudah (σ)",
+            f"{blur_after:.2f}",
+            delta=f"{blur_after - blur_before:+.2f}",
+            delta_color="inverse",
+        )
+
         level, text = quality_label(s_after)
         getattr(st, level)(f"**Kualitas:** {text}")
+
+        if blur_level(blur_before) == "Blur":
+            st.warning(
+                "Gambar original tergolong **blur**. Gunakan metode **Auto** "
+                "atau naikkan kekuatan deblurring. Untuk hasil terbaik, ambil "
+                "ulang dengan fokus kamera pas pada kuku."
+            )
 
         orig_bytes, enh_bytes, mime, ext = build_downloads(
             image_bytes, max_side, opts, save_format
